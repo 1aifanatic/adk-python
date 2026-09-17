@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
+import re
 from typing import Any
 from typing import cast
 from typing import Literal
@@ -41,6 +43,7 @@ from ..errors.input_validation_error import InputValidationError
 from .base_artifact_service import ArtifactVersion
 from .base_artifact_service import BaseArtifactService
 from .base_artifact_service import ensure_part
+from .base_artifact_service import MediaFrame
 
 logger = logging.getLogger("google_adk." + __name__)
 
@@ -48,8 +51,48 @@ _GCS_DISPLAY_NAME_METADATA_KEY = "adkDisplayName"
 _GCS_IS_TEXT_METADATA_KEY = "adkIsText"
 _GCS_FILE_URI_METADATA_KEY = "adkFileUri"
 _GCS_FILE_MIME_TYPE_METADATA_KEY = "adkFileMimeType"
+# Set on the version blob of a media frame collection. The frame index is far
+# too large for GCS custom metadata, so it lives in a sidecar blob; this marker
+# is what tells the version readers to go and fetch it.
+_GCS_MEDIA_COLLECTION_METADATA_KEY = "adkMediaCollection"
+_METADATA_BLOB_SUFFIX = "metadata.json"
+# The child blobs `_save_media_frames` writes beneath a version blob, matched
+# exactly so deleting a collection cannot reach a distinct artifact that
+# happens to be nested under the same prefix.
+# `frame_file_name` zero-pads to a *minimum* of four digits, so a collection of
+# 10,000 frames or more emits `frame_10000.jpeg` and up. `{4,}` keeps the
+# pattern anchored enough that a version blob (which ends in `/{int}` with no
+# extension) still cannot match, while covering those wider indices.
+_FRAME_BLOB_RE = re.compile(r"frames/frame_\d{4,}\.[A-Za-z0-9+._-]+")
+# The same children, but matched relative to the *artifact* prefix instead of
+# the version blob, so a single listing of the artifact can tell a version blob,
+# a child of one, and a nested artifact apart.
+_MEDIA_COLLECTION_CHILD_RE = re.compile(
+    rf"\d+/(?:{re.escape(_METADATA_BLOB_SUFFIX)}|{_FRAME_BLOB_RE.pattern})"
+)
 _MAX_ARTIFACT_REFERENCE_DEPTH = 5
 _MAX_SAVE_VERSION_ATTEMPTS = 10
+
+
+def _is_version_segment(relative_name: str) -> bool:
+  """Returns whether a name relative to an artifact prefix denotes a version.
+
+  Because filenames may contain "/", the prefix of an artifact is also the
+  prefix of every artifact nested under it, and of the frames a media
+  collection writes beneath its own version blob. Only an unqualified integer
+  names a version of the artifact the prefix denotes.
+
+  Args:
+      relative_name: A blob name with the artifact prefix already stripped.
+
+  Returns:
+      True if the name is a version number of this artifact.
+  """
+  if "/" in relative_name:
+    return False
+  # int() also accepts surrounding whitespace, underscores and non-ASCII
+  # digits, none of which _get_blob_name can produce.
+  return relative_name.isascii() and relative_name.isdigit()
 
 
 def _parse_version(blob_name: str, prefix: str) -> Optional[int]:
@@ -74,18 +117,16 @@ def _parse_version(blob_name: str, prefix: str) -> Optional[int]:
       artifact.
   """
   suffix = blob_name[len(prefix) :]
-  if "/" in suffix:
-    # Belongs to a distinct artifact nested under this one.
-    return None
-  # int() also accepts surrounding whitespace, underscores and non-ASCII
-  # digits, none of which _get_blob_name can produce.
-  if not (suffix.isascii() and suffix.isdigit()):
+  if _is_version_segment(suffix):
+    return int(suffix)
+  if "/" not in suffix:
+    # A nested artifact is expected here; an unqualified non-version name is
+    # not, so only that case is worth a warning.
     logger.warning(
         "Skipping blob %s because it does not end with a version number.",
         blob_name,
     )
-    return None
-  return int(suffix)
+  return None
 
 
 class GcsArtifactService(BaseArtifactService):
@@ -124,6 +165,180 @@ class GcsArtifactService(BaseArtifactService):
         artifact,
         custom_metadata,
     )
+
+  @override
+  async def save_media_frames(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      collection_name: str,
+      frames: list[MediaFrame],
+      session_id: Optional[str] = None,
+      custom_metadata: Optional[dict[str, Any]] = None,
+  ) -> int:
+    return await asyncio.to_thread(
+        self._save_media_frames,
+        app_name,
+        user_id,
+        session_id,
+        collection_name,
+        frames,
+        custom_metadata,
+    )
+
+  def _save_media_frames(
+      self,
+      app_name: str,
+      user_id: str,
+      session_id: Optional[str],
+      collection_name: str,
+      frames: list[MediaFrame],
+      custom_metadata: Optional[dict[str, Any]] = None,
+  ) -> int:
+    from google.cloud import exceptions  # pylint: disable=g-import-not-at-top
+
+    if not frames:
+      raise InputValidationError("Cannot save empty frames list.")
+
+    artifact_util.validate_media_collection_name(collection_name)
+
+    if not self._file_has_user_namespace(collection_name):
+      if session_id is None:
+        raise InputValidationError(
+            "Session ID must be provided for session-scoped artifacts."
+        )
+      artifact_util._validate_session_id_for_flat_storage(session_id)
+
+    # Everything that can fail is computed before the first upload. GCS has no
+    # transaction to roll back, so anything that raises partway through leaves
+    # blobs behind; the only defence is to have nothing left to validate by the
+    # time the first one goes up.
+    artifact_util.validate_frame_timestamps(frames)
+
+    # Holding the validated bytes also keeps the upload loop below working on a
+    # plain `bytes`, rather than re-reading the `Optional[bytes]` field that was
+    # already proven non-empty here.
+    frame_payloads: list[bytes] = []
+    for idx, frame in enumerate(frames):
+      if not frame.blob.data:
+        raise InputValidationError(f"Frame {idx} has no byte data.")
+      frame_payloads.append(frame.blob.data)
+
+    start_ts = frames[0].timestamp
+    end_ts = frames[-1].timestamp
+    duration_ms = int((end_ts - start_ts) * 1000)
+    frame_count = len(frames)
+    estimated_fps = (
+        round((frame_count - 1) / (end_ts - start_ts), 2)
+        if duration_ms > 0 and frame_count > 1
+        else 0.0
+    )
+
+    # Frame names are relative to the version prefix, so none of this depends
+    # on which version we end up reserving below.
+    frame_indices = []
+    frame_names = []
+    primary_mime_type = artifact_util.DEFAULT_FRAME_MIME_TYPE
+    for idx, frame in enumerate(frames):
+      mime = (
+          frame.blob.mime_type or artifact_util.DEFAULT_FRAME_MIME_TYPE
+      ).lower()
+      if idx == 0:
+        primary_mime_type = mime
+      frame_name = artifact_util.frame_file_name(idx, mime)
+      frame_names.append((frame_name, mime))
+      frame_indices.append({
+          "frameIndex": idx,
+          "offsetMs": int((frame.timestamp - start_ts) * 1000),
+          "fileName": f"{artifact_util.FRAMES_DIR_NAME}/{frame_name}",
+          "mimeType": mime,
+          "sizeBytes": len(frame_payloads[idx]),
+      })
+
+    # Caller metadata goes in first so the system keys below win a collision.
+    # FileArtifactService and InMemoryArtifactService apply the same
+    # precedence; letting a caller redefine frameCount or frames would make the
+    # sidecar disagree with the blobs actually written.
+    metadata_payload = dict(custom_metadata or {})
+    metadata_payload.update({
+        "type": artifact_util.MEDIA_COLLECTION_TYPE,
+        "frameCount": frame_count,
+        "startTimestampMs": int(start_ts * 1000),
+        "endTimestampMs": int(end_ts * 1000),
+        "durationMs": duration_ms,
+        "estimatedFps": estimated_fps,
+        "frames": frame_indices,
+    })
+
+    # Serialized here rather than at the point of upload: a caller who puts
+    # something unserializable in custom_metadata would otherwise fail after
+    # every frame blob was already written, and those frames would be
+    # unreachable forever because no version blob exists for delete_artifact to
+    # find them under.
+    try:
+      metadata_json = json.dumps(metadata_payload)
+    except (TypeError, ValueError) as e:
+      raise InputValidationError(
+          "custom_metadata must be JSON-serializable for a media collection;"
+          f" {e}"
+      ) from e
+
+    versions = self._list_versions(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=session_id,
+        filename=collection_name,
+    )
+    version = 0 if not versions else max(versions) + 1
+
+    # Reserve the version the same way _save_artifact does. Listing does not
+    # reserve, so without if_generation_match=0 two concurrent collections pick
+    # the same number and overwrite each other's frames and sidecar.
+    #
+    # The version blob doubles as the preview for
+    # load_artifact(filename=collection_name), and carries a marker telling the
+    # version readers to pick the full metadata up from the sidecar; GCS custom
+    # metadata is capped at a few KiB, which a frame index will exceed.
+    #
+    # Reserving first does make the version briefly visible before its children
+    # land. That is the better failure mode: an interrupted save leaves a
+    # version delete_artifact can still clean up, whereas publishing last left
+    # orphaned frames that nothing could ever reach.
+    attempts_left = _MAX_SAVE_VERSION_ATTEMPTS
+    while True:
+      prefix = self._get_blob_name(
+          app_name, user_id, collection_name, version, session_id
+      )
+      preview_blob = self.bucket.blob(prefix)
+      preview_blob.metadata = {_GCS_MEDIA_COLLECTION_METADATA_KEY: "true"}
+      try:
+        preview_blob.upload_from_string(
+            data=frame_payloads[0],
+            content_type=primary_mime_type,
+            if_generation_match=0,
+        )
+      except exceptions.PreconditionFailed:
+        attempts_left -= 1
+        if not attempts_left:
+          raise
+        version += 1
+        continue
+      break
+
+    for idx, (frame_name, mime) in enumerate(frame_names):
+      frame_blob = self.bucket.blob(
+          f"{prefix}/{artifact_util.FRAMES_DIR_NAME}/{frame_name}"
+      )
+      frame_blob.upload_from_string(data=frame_payloads[idx], content_type=mime)
+
+    metadata_blob = self.bucket.blob(f"{prefix}/{_METADATA_BLOB_SUFFIX}")
+    metadata_blob.upload_from_string(
+        data=metadata_json,
+        content_type="application/json",
+    )
+
+    return version
 
   @override
   async def load_artifact(
@@ -432,6 +647,32 @@ class GcsArtifactService(BaseArtifactService):
         data=artifact_bytes, mime_type=blob.content_type
     )
 
+  def _artifact_name_from_blob(
+      self, blob_name: str, scope_prefix: str
+  ) -> Optional[str]:
+    """Returns the artifact name a blob belongs to, or None if it is not a version.
+
+    GCS has a flat namespace, so listing a scope returns every blob beneath it,
+    including the `frames/` payloads and `metadata.json` sidecar that a media
+    frame collection writes under its own version blob. Only a blob whose final
+    segment is a version number names an artifact; treating the rest as
+    artifacts invents keys like "col/0" and "col/0/frames" that no caller can
+    load or delete.
+
+    Args:
+        blob_name: The full blob name.
+        scope_prefix: The session or user scope prefix, including the trailing
+          "/".
+
+    Returns:
+        The artifact name relative to the scope, or None.
+    """
+    fn_and_version = blob_name[len(scope_prefix) :]
+    name, separator, version = fn_and_version.rpartition("/")
+    if not separator or not _is_version_segment(version):
+      return None
+    return name
+
   def _list_artifact_keys(
       self, app_name: str, user_id: str, session_id: Optional[str]
   ) -> list[str]:
@@ -441,31 +682,19 @@ class GcsArtifactService(BaseArtifactService):
       artifact_util.validate_path_segment(session_id, "session_id")
     filenames = set()
 
+    scope_prefixes = [f"{app_name}/{user_id}/user/"]
     if session_id:
-      session_prefix = f"{app_name}/{user_id}/{session_id}/"
-      session_blobs = self.storage_client.list_blobs(
-          self.bucket, prefix=session_prefix
-      )
-      for blob in session_blobs:
-        # blob.name is like session_prefix/filename/version
-        # or session_prefix/path/to/filename/version
-        # we need to extract filename including slashes, but remove prefix
-        # and /version
-        fn_and_version = blob.name[len(session_prefix) :]
-        filename = "/".join(fn_and_version.split("/")[:-1])
-        filenames.add(filename)
+      scope_prefixes.append(f"{app_name}/{user_id}/{session_id}/")
 
-    user_namespace_prefix = f"{app_name}/{user_id}/user/"
-    user_namespace_blobs = self.storage_client.list_blobs(
-        self.bucket, prefix=user_namespace_prefix
-    )
-    for blob in user_namespace_blobs:
-      # blob.name is like user_namespace_prefix/filename/version
-      fn_and_version = blob.name[len(user_namespace_prefix) :]
-      filename = "/".join(fn_and_version.split("/")[:-1])
-      filenames.add(filename)
+    for scope_prefix in scope_prefixes:
+      for blob in self.storage_client.list_blobs(
+          self.bucket, prefix=scope_prefix
+      ):
+        filename = self._artifact_name_from_blob(blob.name, scope_prefix)
+        if filename:
+          filenames.add(filename)
 
-    return sorted(list(filenames))
+    return sorted(filenames)
 
   def _delete_artifact(
       self,
@@ -474,19 +703,41 @@ class GcsArtifactService(BaseArtifactService):
       session_id: Optional[str],
       filename: str,
   ) -> None:
-    versions = self._list_versions(
-        app_name=app_name,
-        user_id=user_id,
-        session_id=session_id,
-        filename=filename,
+    """Deletes every version of an artifact, and any media frames beneath them.
+
+    One LIST covers the whole artifact. A media frame collection nests its
+    frames and `metadata.json` under its own version blob, so those children
+    share the artifact prefix and already appear in this listing; scanning per
+    version would re-walk the same objects once per version and bill an extra
+    LIST to every ordinary artifact, which never has children at all.
+
+    Args:
+        app_name: The name of the application.
+        user_id: The ID of the user who owns the artifact.
+        session_id: The ID of the session (ignored for user-namespaced files).
+        filename: The name of the artifact file.
+    """
+    prefix = (
+        f"{self._get_blob_prefix(app_name, user_id, filename, session_id)}/"
     )
-    for version in versions:
-      blob_name = self._get_blob_name(
-          app_name, user_id, filename, version, session_id
-      )
-      blob = self.bucket.blob(blob_name)
+    version_blobs = []
+    child_blobs = []
+    for blob in self.storage_client.list_blobs(self.bucket, prefix=prefix):
+      relative_name = blob.name[len(prefix) :]
+      if _is_version_segment(relative_name):
+        version_blobs.append(blob)
+      elif _MEDIA_COLLECTION_CHILD_RE.fullmatch(relative_name):
+        child_blobs.append(blob)
+      # Anything else belongs to a distinct artifact nested under this one --
+      # filenames may contain "/", so this prefix is also their prefix.
+
+    # Children first: a version blob is what makes its children reachable, so
+    # losing the process in between leaves cleanable state rather than frames
+    # that `_list_versions` can no longer see.
+    for blob in child_blobs:
       blob.delete()
-    return
+    for blob in version_blobs:
+      blob.delete()
 
   def _list_versions(
       self,
@@ -527,6 +778,54 @@ class GcsArtifactService(BaseArtifactService):
     versions.sort()
     return versions
 
+  def _custom_metadata_for_version_blob(self, blob: Any) -> dict[str, Any]:
+    """Returns the custom metadata for a version blob.
+
+    A media frame collection cannot keep its metadata on the blob itself --
+    the frame index alone will exceed the few KiB GCS allows for custom
+    metadata -- so `_save_media_frames` writes a JSON sidecar and leaves a
+    marker behind. Resolving that here keeps `get_artifact_version` and
+    `list_artifact_versions` returning the same shape for every artifact kind,
+    and costs an extra read only for collections.
+
+    Args:
+        blob: The version blob.
+
+    Returns:
+        The custom metadata, or an empty dict when there is none.
+    """
+    metadata = blob.metadata or {}
+    if not metadata.get(_GCS_MEDIA_COLLECTION_METADATA_KEY):
+      return dict(metadata)
+
+    sidecar = self.bucket.get_blob(f"{blob.name}/{_METADATA_BLOB_SUFFIX}")
+    if sidecar is None:
+      logger.warning(
+          "Media collection %s is missing its %s sidecar; returning no"
+          " metadata.",
+          blob.name,
+          _METADATA_BLOB_SUFFIX,
+      )
+      return {}
+    try:
+      parsed = json.loads(sidecar.download_as_bytes())
+    except (ValueError, TypeError):
+      logger.warning(
+          "Could not parse the %s sidecar for media collection %s.",
+          _METADATA_BLOB_SUFFIX,
+          blob.name,
+      )
+      return {}
+    if not isinstance(parsed, dict):
+      logger.warning(
+          "The %s sidecar for media collection %s is a %s, not a JSON object.",
+          _METADATA_BLOB_SUFFIX,
+          blob.name,
+          type(parsed).__name__,
+      )
+      return {}
+    return parsed
+
   def _get_artifact_version_sync(
       self,
       app_name: str,
@@ -561,7 +860,7 @@ class GcsArtifactService(BaseArtifactService):
         canonical_uri=canonical_uri,
         create_time=blob.time_created.timestamp(),
         mime_type=blob.content_type,
-        custom_metadata=blob.metadata if blob.metadata else {},
+        custom_metadata=self._custom_metadata_for_version_blob(blob),
     )
 
   def _list_artifact_versions_sync(
@@ -588,7 +887,7 @@ class GcsArtifactService(BaseArtifactService):
           canonical_uri=canonical_uri,
           create_time=blob.time_created.timestamp(),
           mime_type=blob.content_type,
-          custom_metadata=blob.metadata if blob.metadata else {},
+          custom_metadata=self._custom_metadata_for_version_blob(blob),
       )
       artifact_versions.append(av)
 

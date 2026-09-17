@@ -33,10 +33,13 @@ from unittest.mock import patch
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
+from google.adk.artifacts import artifact_util
 from google.adk.artifacts import file_artifact_service
 from google.adk.artifacts import gcs_artifact_service
 from google.adk.artifacts.base_artifact_service import ArtifactVersion
+from google.adk.artifacts.base_artifact_service import BaseArtifactService
 from google.adk.artifacts.base_artifact_service import ensure_part
+from google.adk.artifacts.base_artifact_service import MediaFrame
 from google.adk.artifacts.file_artifact_service import FileArtifactService
 from google.adk.artifacts.gcs_artifact_service import GcsArtifactService
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
@@ -3486,3 +3489,1175 @@ async def test_list_artifact_keys_survives_metadata_path_shadowed_by_dir(
   # The shadowed artifact has no readable metadata, so it is listed by its
   # scope-relative path rather than dropped or raised on.
   assert keys == ["user:a"]
+
+
+@pytest.mark.asyncio
+async def test_file_artifact_service_save_media_frames(tmp_path):
+  """FileArtifactService saves frames, creates metadata.json, and supports preview load."""
+  service = FileArtifactService(root_dir=tmp_path / "artifacts")
+  frames = [
+      MediaFrame(
+          blob=types.Blob(data=b"frame_data_0", mime_type="image/jpeg"),
+          timestamp=0.0,
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"frame_data_1", mime_type="image/jpeg"),
+          timestamp=0.5,
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"frame_data_2", mime_type="image/jpeg"),
+          timestamp=1.0,
+      ),
+  ]
+
+  version = await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="input_media_20260101_120000_000000",
+      frames=frames,
+      custom_metadata={"test_key": "test_value"},
+  )
+
+  assert version == 0
+
+  # Loading artifact by collection name should return preview Part (frame_0000)
+  preview_part = await service.load_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="input_media_20260101_120000_000000",
+  )
+  assert preview_part is not None
+  assert preview_part.inline_data.data == b"frame_data_0"
+  assert preview_part.inline_data.mime_type == "image/jpeg"
+
+  # Verify on-disk structure
+  artifact_dir = (
+      service._artifact_dir(
+          app_name="app",
+          user_id="user",
+          session_id="session",
+          filename="input_media_20260101_120000_000000",
+      )
+      / "versions"
+      / "0"
+  )
+  assert (artifact_dir / "frames" / "frame_0000.jpeg").is_file()
+  assert (artifact_dir / "frames" / "frame_0001.jpeg").is_file()
+  assert (artifact_dir / "frames" / "frame_0002.jpeg").is_file()
+  assert (artifact_dir / "metadata.json").is_file()
+
+  with open(artifact_dir / "metadata.json", "r", encoding="utf-8") as f:
+    metadata = json.load(f)
+
+  custom_meta = metadata.get(
+      "customMetadata", metadata.get("custom_metadata", {})
+  )
+  assert custom_meta["frameCount"] == 3
+  assert custom_meta["estimatedFps"] == 2.0
+  assert custom_meta["durationMs"] == 1000
+  assert custom_meta["test_key"] == "test_value"
+  assert len(custom_meta["frames"]) == 3
+  assert custom_meta["frames"][0]["frameIndex"] == 0
+  assert custom_meta["frames"][0]["fileName"] == "frames/frame_0000.jpeg"
+  assert custom_meta["frames"][0]["offsetMs"] == 0
+
+
+@pytest.mark.asyncio
+async def test_file_artifact_service_save_media_frames_empty_raises(tmp_path):
+  """Saving an empty list of frames raises InputValidationError."""
+  service = FileArtifactService(root_dir=tmp_path / "artifacts")
+  with pytest.raises(
+      InputValidationError, match="Cannot save empty frames list."
+  ):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name="test_media",
+        frames=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_memory_artifact_service_save_media_frames():
+  """InMemoryArtifactService saves frames and supports preview load."""
+  service = InMemoryArtifactService()
+  frames = [
+      MediaFrame(
+          blob=types.Blob(data=b"frame_0", mime_type="image/jpeg"),
+          timestamp=0.0,
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"frame_1", mime_type="image/jpeg"),
+          timestamp=0.5,
+      ),
+  ]
+
+  version = await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="media_test",
+      frames=frames,
+      custom_metadata={"source": "camera"},
+  )
+
+  assert version == 0
+  loaded = await service.load_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="media_test",
+  )
+  assert loaded is not None
+  assert loaded.inline_data.data == b"frame_0"
+
+  # Every frame is retained, not just the preview: dropping frames[1:] here
+  # would silently lose media for anyone developing against this backend.
+  entry = service.artifacts["app/user/session/media_test"][0]
+  assert [frame.data for frame in entry.media_frames] == [
+      b"frame_0",
+      b"frame_1",
+  ]
+
+  artifact_version = await service.get_artifact_version(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="media_test",
+      version=0,
+  )
+  metadata = artifact_version.custom_metadata
+  assert metadata["type"] == "video_frame_sequence"
+  assert metadata["frameCount"] == 2
+  assert metadata["durationMs"] == 500
+  assert metadata["estimatedFps"] == 2.0
+  assert metadata["source"] == "camera"
+  assert [frame["fileName"] for frame in metadata["frames"]] == [
+      "frames/frame_0000.jpeg",
+      "frames/frame_0001.jpeg",
+  ]
+  assert [frame["offsetMs"] for frame in metadata["frames"]] == [0, 500]
+
+  with pytest.raises(InputValidationError):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name="media_test",
+        frames=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_gcs_artifact_service_save_media_frames():
+  """GcsArtifactService saves frame blobs, preview blob, and metadata.json."""
+  service = mock_gcs_artifact_service()
+  frames = [
+      MediaFrame(
+          blob=types.Blob(data=b"gcs_frame_0", mime_type="image/jpeg"),
+          timestamp=0.0,
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"gcs_frame_1", mime_type="image/jpeg"),
+          timestamp=1.0,
+      ),
+  ]
+
+  version = await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="gcs_media",
+      frames=frames,
+      custom_metadata={"source": "camera"},
+  )
+
+  assert version == 0
+  loaded = await service.load_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="gcs_media",
+  )
+  assert loaded is not None
+  assert loaded.inline_data.data == b"gcs_frame_0"
+
+  # Asserted by name because the layout is the contract: the version blob
+  # doubles as the preview, and the frames and sidecar hang off it.
+  version_prefix = "app/user/session/gcs_media/0"
+  written = {
+      name: blob.content
+      for name, blob in service.bucket.blobs.items()
+      if blob.content is not None
+  }
+  assert set(written) == {
+      version_prefix,
+      f"{version_prefix}/frames/frame_0000.jpeg",
+      f"{version_prefix}/frames/frame_0001.jpeg",
+      f"{version_prefix}/metadata.json",
+  }
+  assert written[version_prefix] == b"gcs_frame_0"
+  assert written[f"{version_prefix}/frames/frame_0000.jpeg"] == b"gcs_frame_0"
+  assert written[f"{version_prefix}/frames/frame_0001.jpeg"] == b"gcs_frame_1"
+
+  metadata = json.loads(written[f"{version_prefix}/metadata.json"])
+  assert metadata["type"] == "video_frame_sequence"
+  assert metadata["frameCount"] == 2
+  assert metadata["durationMs"] == 1000
+  assert metadata["estimatedFps"] == 1.0
+  # Caller metadata is merged flat rather than nested under a key.
+  assert metadata["source"] == "camera"
+  assert [frame["fileName"] for frame in metadata["frames"]] == [
+      "frames/frame_0000.jpeg",
+      "frames/frame_0001.jpeg",
+  ]
+  assert [frame["offsetMs"] for frame in metadata["frames"]] == [0, 1000]
+  assert [frame["sizeBytes"] for frame in metadata["frames"]] == [11, 11]
+
+  with pytest.raises(InputValidationError):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name="gcs_media",
+        frames=[],
+    )
+
+
+def _media_frames(count: int = 2) -> list[MediaFrame]:
+  """Builds a simple frame batch."""
+  return [
+      MediaFrame(
+          blob=types.Blob(data=f"frame_{i}".encode(), mime_type="image/jpeg"),
+          timestamp=i * 0.5,
+      )
+      for i in range(count)
+  ]
+
+
+@pytest.mark.asyncio
+async def test_gcs_media_frames_do_not_pollute_list_artifact_keys():
+  """The frame and metadata blobs must not surface as their own artifacts.
+
+  They are written beneath the version blob, so a listing that strips only the
+  final path segment invents keys like "gcs_media/0" and "gcs_media/0/frames"
+  that no caller can load or delete.
+  """
+  service = mock_gcs_artifact_service()
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="gcs_media",
+      frames=_media_frames(3),
+  )
+
+  keys = await service.list_artifact_keys(
+      app_name="app", user_id="user", session_id="session"
+  )
+
+  assert keys == ["gcs_media"]
+
+
+@pytest.mark.asyncio
+async def test_gcs_list_artifact_keys_still_reports_nested_filenames():
+  """Filenames may legitimately contain "/", and must survive the version filter."""
+  service = mock_gcs_artifact_service()
+  await service.save_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="nested/path/file.txt",
+      artifact=types.Part.from_bytes(data=b"x", mime_type="text/plain"),
+  )
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="camera/front",
+      frames=_media_frames(),
+  )
+
+  keys = await service.list_artifact_keys(
+      app_name="app", user_id="user", session_id="session"
+  )
+
+  assert keys == ["camera/front", "nested/path/file.txt"]
+
+
+@pytest.mark.asyncio
+async def test_gcs_delete_media_collection_removes_frame_and_metadata_blobs():
+  """Deleting a collection must not leak its frames and sidecar in the bucket."""
+  service = mock_gcs_artifact_service()
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="gcs_media",
+      frames=_media_frames(3),
+  )
+  prefix = "app/user/session/gcs_media/0"
+  live_before = {
+      name
+      for name, blob in service.bucket.blobs.items()
+      if blob.content is not None
+  }
+  assert f"{prefix}/frames/frame_0000.jpeg" in live_before
+  assert f"{prefix}/metadata.json" in live_before
+
+  await service.delete_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="gcs_media",
+  )
+
+  live_after = {
+      name
+      for name, blob in service.bucket.blobs.items()
+      if blob.content is not None
+  }
+  assert not live_after
+  assert (
+      await service.list_artifact_keys(
+          app_name="app", user_id="user", session_id="session"
+      )
+      == []
+  )
+
+
+@pytest.mark.asyncio
+async def test_gcs_delete_media_collection_spares_nested_artifact():
+  """A distinct artifact nested under the version prefix must survive.
+
+  Filenames may contain "/", so "gcs_media/0" is a legitimate artifact whose
+  blobs sit under the same prefix as version 0 of "gcs_media". Deleting the
+  collection must not take it along.
+  """
+  service = mock_gcs_artifact_service()
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="gcs_media",
+      frames=_media_frames(),
+  )
+  await service.save_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="gcs_media/0",
+      artifact=types.Part.from_bytes(data=b"nested", mime_type="text/plain"),
+  )
+
+  await service.delete_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="gcs_media",
+  )
+
+  nested = await service.load_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="gcs_media/0",
+  )
+  assert nested is not None
+  assert nested.inline_data.data == b"nested"
+
+
+@pytest.mark.asyncio
+async def test_gcs_media_frames_metadata_round_trips():
+  """get_artifact_version must return the frame metadata, not an empty dict.
+
+  The frame index is far too large for GCS custom metadata, so it lives in a
+  sidecar blob; the version readers have to pick it up from there.
+  """
+  service = mock_gcs_artifact_service()
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="gcs_media",
+      frames=_media_frames(3),
+      custom_metadata={"source": "cam"},
+  )
+
+  artifact_version = await service.get_artifact_version(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="gcs_media",
+  )
+
+  assert artifact_version is not None
+  metadata = artifact_version.custom_metadata
+  assert metadata["source"] == "cam"
+  assert metadata["frameCount"] == 3
+  assert metadata["type"] == "video_frame_sequence"
+  assert len(metadata["frames"]) == 3
+  assert metadata["frames"][0]["fileName"] == "frames/frame_0000.jpeg"
+
+  listed = await service.list_artifact_versions(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="gcs_media",
+  )
+  assert [v.custom_metadata["frameCount"] for v in listed] == [3]
+
+
+@pytest.mark.asyncio
+async def test_gcs_ordinary_artifact_metadata_is_unchanged():
+  """The sidecar lookup must only apply to media collections."""
+  service = mock_gcs_artifact_service()
+  await service.save_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="plain.txt",
+      artifact=types.Part.from_bytes(data=b"x", mime_type="text/plain"),
+      custom_metadata={"k": "v"},
+  )
+
+  artifact_version = await service.get_artifact_version(
+      app_name="app", user_id="user", session_id="session", filename="plain.txt"
+  )
+
+  assert artifact_version is not None
+  assert artifact_version.custom_metadata["k"] == "v"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+async def test_save_media_frames_system_metadata_wins(
+    service_type, artifact_service_factory
+):
+  """A caller must not be able to redefine the system metadata keys.
+
+  Letting custom_metadata overwrite frameCount or frames would make the
+  recorded metadata disagree with the frames actually written.
+  """
+  service = artifact_service_factory(service_type)
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="media",
+      frames=_media_frames(2),
+      custom_metadata={"frameCount": 99, "frames": [], "mine": "kept"},
+  )
+
+  artifact_version = await service.get_artifact_version(
+      app_name="app", user_id="user", session_id="session", filename="media"
+  )
+
+  assert artifact_version is not None
+  assert artifact_version.custom_metadata["frameCount"] == 2
+  assert len(artifact_version.custom_metadata["frames"]) == 2
+  assert artifact_version.custom_metadata["mine"] == "kept"
+
+
+@pytest.mark.asyncio
+async def test_gcs_media_frames_rejected_batch_publishes_no_version():
+  """A frame rejected mid-batch must not leave a readable version behind.
+
+  GCS has no transaction to roll back, so the whole batch is validated before
+  anything is uploaded and the version blob is published last.
+  """
+  service = mock_gcs_artifact_service()
+  frames = [
+      MediaFrame(
+          blob=types.Blob(data=b"ok", mime_type="image/jpeg"), timestamp=0.0
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"", mime_type="image/jpeg"), timestamp=1.0
+      ),
+  ]
+
+  with pytest.raises(InputValidationError, match="Frame 1 has no byte data."):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name="gcs_media",
+        frames=frames,
+    )
+
+  assert (
+      await service.list_versions(
+          app_name="app",
+          user_id="user",
+          session_id="session",
+          filename="gcs_media",
+      )
+      == []
+  )
+  assert (
+      await service.load_artifact(
+          app_name="app",
+          user_id="user",
+          session_id="session",
+          filename="gcs_media",
+      )
+      is None
+  )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+async def test_save_media_frames_rejects_empty_frame(
+    service_type, artifact_service_factory
+):
+  """Every backend must reject an empty frame, not just the durable ones."""
+  service = artifact_service_factory(service_type)
+
+  with pytest.raises(InputValidationError, match="Frame 1 has no byte data."):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name="media",
+        frames=[
+            MediaFrame(
+                blob=types.Blob(data=b"ok", mime_type="image/jpeg"),
+                timestamp=0.0,
+            ),
+            MediaFrame(
+                blob=types.Blob(data=b"", mime_type="image/jpeg"), timestamp=1.0
+            ),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [ArtifactServiceType.IN_MEMORY, ArtifactServiceType.GCS],
+)
+async def test_save_media_frames_rejects_reserved_session_id(
+    service_type, artifact_service_factory
+):
+  """Flat-storage backends reserve "user" as a session segment.
+
+  save_artifact already rejects it; without the same check here a session
+  called "user" writes its frames straight into the user-scoped namespace.
+  """
+  service = artifact_service_factory(service_type)
+
+  with pytest.raises(InputValidationError, match="reserved value 'user'"):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="user",
+        collection_name="media",
+        frames=_media_frames(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_save_media_frames_rejects_frames_collection_name(tmp_path):
+  """A collection named "frames" collides with the frames subdirectory.
+
+  The preview is written as `staging_dir / <collection name>`, which is the
+  frames directory itself, so this used to fail with IsADirectoryError partway
+  through the save.
+  """
+  service = FileArtifactService(root_dir=tmp_path / "artifacts")
+
+  for name in ("frames", "camera/frames", "Frames"):
+    with pytest.raises(InputValidationError, match="reserved"):
+      await service.save_media_frames(
+          app_name="app",
+          user_id="user",
+          session_id="session",
+          collection_name=name,
+          frames=_media_frames(),
+      )
+
+
+@pytest.mark.asyncio
+async def test_file_save_media_frames_sanitizes_mime_type_extension(tmp_path):
+  """The extension is derived from a caller-supplied mime type and lands in a path.
+
+  Every other caller-supplied path input in this service is validated against
+  both POSIX and Windows traversal; the extension has to meet the same bar. A
+  subtype that is not a plausible extension falls back to the default rather
+  than raising, so one odd mime type does not fail a whole frame batch.
+  """
+  service = FileArtifactService(root_dir=tmp_path / "artifacts")
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="media",
+      frames=[
+          # Backslashes survive the "/" split, so this is the form that would
+          # escape frames_dir on Windows.
+          MediaFrame(
+              blob=types.Blob(
+                  data=b"payload", mime_type="image/jpeg\\..\\..\\x.bin"
+              ),
+              timestamp=0.0,
+          ),
+          # A subtype that is exactly a traversal segment.
+          MediaFrame(
+              blob=types.Blob(data=b"payload", mime_type="image/.."),
+              timestamp=0.5,
+          ),
+          # An ordinary subtype must still be preserved.
+          MediaFrame(
+              blob=types.Blob(data=b"payload", mime_type="image/png"),
+              timestamp=1.0,
+          ),
+      ],
+  )
+
+  version_dir = (
+      service._artifact_dir(
+          app_name="app",
+          user_id="user",
+          session_id="session",
+          filename="media",
+      )
+      / "versions"
+      / "0"
+  )
+  frame_names = sorted(p.name for p in (version_dir / "frames").iterdir())
+  assert frame_names == [
+      "frame_0000.jpeg",
+      "frame_0001.jpeg",
+      "frame_0002.png",
+  ]
+  assert all(
+      "/" not in name and "\\" not in name and ".." not in name
+      for name in frame_names
+  )
+  # Nothing escaped the staging directory.
+  assert not (tmp_path / "x.bin").exists()
+
+
+@pytest.mark.asyncio
+async def test_in_memory_save_media_frames_retains_every_frame():
+  """The in-memory backend must not drop frames[1:].
+
+  The durable backends persist every frame, so the same code would otherwise
+  lose media purely because of which service happens to be configured.
+  """
+  service = InMemoryArtifactService()
+  frames = _media_frames(3)
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="media",
+      frames=frames,
+  )
+
+  entry = service.artifacts["app/user/session/media"][0]
+  assert entry.media_frames is not None
+  assert [blob.data for blob in entry.media_frames] == [
+      b"frame_0",
+      b"frame_1",
+      b"frame_2",
+  ]
+  # The preview still mirrors what the durable backends return from
+  # load_artifact.
+  assert entry.data.inline_data.data == b"frame_0"
+
+
+@pytest.mark.asyncio
+async def test_gcs_delete_media_collection_removes_wide_index_frames():
+  """Frames numbered 10000 and above must be deleted along with the rest.
+
+  `frame_file_name` zero-pads to a *minimum* of four digits, so a collection
+  that long emits `frame_10000.jpeg` and wider. A delete pattern pinned to
+  exactly four digits leaves every one of them in the bucket permanently.
+  """
+  service = mock_gcs_artifact_service()
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="gcs_media",
+      frames=_media_frames(2),
+  )
+  prefix = "app/user/session/gcs_media/0"
+  # Writing the wide-index blobs directly keeps this fast; uploading 10,001
+  # real frames would drive the identical delete path.
+  for name in (
+      f"{prefix}/frames/frame_10000.jpeg",
+      f"{prefix}/frames/frame_987654.png",
+  ):
+    service.bucket.blob(name).upload_from_string(
+        data=b"wide", content_type="image/jpeg"
+    )
+
+  await service.delete_artifact(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      filename="gcs_media",
+  )
+
+  live_after = {
+      name
+      for name, blob in service.bucket.blobs.items()
+      if blob.content is not None
+  }
+  assert not live_after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+async def test_save_media_frames_normalizes_mime_type_case(
+    service_type, artifact_service_factory
+):
+  """Every backend must report one MIME type for one input.
+
+  The per-frame entries in custom_metadata are already lowercased, so a backend
+  that skips normalizing the collection's own mime_type disagrees both with its
+  own metadata and with the other two backends.
+  """
+  service = artifact_service_factory(service_type)
+  await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="media",
+      frames=[
+          MediaFrame(
+              blob=types.Blob(data=b"f0", mime_type="image/JPEG"), timestamp=0.0
+          )
+      ],
+  )
+
+  loaded = await service.load_artifact(
+      app_name="app", user_id="user", session_id="session", filename="media"
+  )
+
+  assert loaded.inline_data.mime_type == "image/jpeg"
+  version = await service.get_artifact_version(
+      app_name="app", user_id="user", session_id="session", filename="media"
+  )
+  assert version.mime_type == "image/jpeg"
+  assert version.custom_metadata["frames"][0]["mimeType"] == "image/jpeg"
+
+
+class _MinimalArtifactService(BaseArtifactService):
+  """Implements only the abstract surface, as a third-party service would."""
+
+  async def save_artifact(self, **kwargs: Any) -> int:
+    return 0
+
+  async def load_artifact(self, **kwargs: Any) -> Optional[types.Part]:
+    return None
+
+  async def list_artifact_keys(self, **kwargs: Any) -> list[str]:
+    return []
+
+  async def delete_artifact(self, **kwargs: Any) -> None:
+    return None
+
+  async def list_versions(self, **kwargs: Any) -> list[int]:
+    return []
+
+  async def list_artifact_versions(
+      self, **kwargs: Any
+  ) -> list[ArtifactVersion]:
+    return []
+
+  async def get_artifact_version(
+      self, **kwargs: Any
+  ) -> Optional[ArtifactVersion]:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_base_artifact_service_save_media_frames_raises():
+  """The base class must refuse media frames rather than silently drop them.
+
+  save_media_frames is deliberately concrete so that services written against
+  the older interface stay instantiable -- which instantiating
+  _MinimalArtifactService here proves -- but that choice is only safe while the
+  default still raises.
+  """
+  service = _MinimalArtifactService()
+
+  with pytest.raises(NotImplementedError) as excinfo:
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name="media",
+        frames=_media_frames(1),
+    )
+
+  assert "_MinimalArtifactService" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+async def test_save_media_frames_rejects_decreasing_timestamps(
+    service_type, artifact_service_factory
+):
+  """Out-of-order frames must fail rather than persist negative durations.
+
+  durationMs comes from the first and last frame and each offsetMs from the
+  first, so a backwards batch is recorded happily as negative milliseconds and
+  a meaningless estimatedFps.
+  """
+  service = artifact_service_factory(service_type)
+  frames = [
+      MediaFrame(
+          blob=types.Blob(data=b"f0", mime_type="image/jpeg"), timestamp=2.0
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"f1", mime_type="image/jpeg"), timestamp=1.0
+      ),
+  ]
+
+  with pytest.raises(InputValidationError, match="non-decreasing"):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name="media",
+        frames=frames,
+    )
+
+  # The rejected batch must not have reserved a version.
+  assert (
+      await service.list_versions(
+          app_name="app",
+          user_id="user",
+          session_id="session",
+          filename="media",
+      )
+      == []
+  )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.GCS,
+        ArtifactServiceType.FILE,
+    ],
+)
+async def test_save_media_frames_allows_equal_timestamps(
+    service_type, artifact_service_factory
+):
+  """Frames captured within one clock tick are legitimate, not an error."""
+  service = artifact_service_factory(service_type)
+  frames = [
+      MediaFrame(
+          blob=types.Blob(data=b"f0", mime_type="image/jpeg"), timestamp=1.0
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"f1", mime_type="image/jpeg"), timestamp=1.0
+      ),
+  ]
+
+  version = await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="media",
+      frames=frames,
+  )
+
+  assert version == 0
+  stored = await service.get_artifact_version(
+      app_name="app", user_id="user", session_id="session", filename="media"
+  )
+  assert stored.custom_metadata["durationMs"] == 0
+  assert stored.custom_metadata["estimatedFps"] == 0.0
+  assert [f["offsetMs"] for f in stored.custom_metadata["frames"]] == [0, 0]
+
+
+def test_validate_frame_timestamps_reports_the_offending_pair():
+  """The error must name the frame that went backwards, not just complain."""
+  frames = [
+      MediaFrame(
+          blob=types.Blob(data=b"f0", mime_type="image/jpeg"), timestamp=0.0
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"f1", mime_type="image/jpeg"), timestamp=5.0
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"f2", mime_type="image/jpeg"), timestamp=3.0
+      ),
+  ]
+
+  with pytest.raises(InputValidationError) as excinfo:
+    artifact_util.validate_frame_timestamps(frames)
+
+  message = str(excinfo.value)
+  assert "frame 2" in message
+  assert "3.0" in message
+  assert "5.0" in message
+
+
+def test_validate_frame_timestamps_accepts_short_batches():
+  """A single frame, or none, has no ordering to violate."""
+  artifact_util.validate_frame_timestamps([])
+  artifact_util.validate_frame_timestamps([
+      MediaFrame(
+          blob=types.Blob(data=b"f0", mime_type="image/jpeg"), timestamp=9.0
+      )
+  ])
+
+
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.FILE,
+        ArtifactServiceType.GCS,
+    ],
+)
+@pytest.mark.parametrize(
+    "collection_name",
+    ["frames", "Frames", "nested/frames", "user:frames"],
+)
+@pytest.mark.asyncio
+async def test_save_media_frames_rejects_frames_collection_name(
+    artifact_service_factory, service_type, collection_name
+):
+  """Every backend rejects a collection whose own segment is "frames".
+
+  Only FileArtifactService actually breaks on it, but a name that stores on two
+  backends and fails on the third gives callers no portable contract.
+  """
+  service = artifact_service_factory(service_type)
+
+  with pytest.raises(InputValidationError, match="reserved for media frame"):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name=collection_name,
+        frames=_media_frames(),
+    )
+
+
+@pytest.mark.parametrize(
+    "service_type",
+    [
+        ArtifactServiceType.IN_MEMORY,
+        ArtifactServiceType.FILE,
+        ArtifactServiceType.GCS,
+    ],
+)
+@pytest.mark.asyncio
+async def test_save_media_frames_allows_name_merely_containing_frames(
+    artifact_service_factory, service_type
+):
+  """Only the final segment is reserved; "frames_raw" is an ordinary name."""
+  service = artifact_service_factory(service_type)
+
+  version = await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="frames_raw",
+      frames=_media_frames(),
+  )
+
+  assert version == 0
+
+
+@pytest.mark.asyncio
+async def test_gcs_save_media_frames_rejects_unserializable_metadata():
+  """A bad custom_metadata fails before anything reaches the bucket.
+
+  GCS has no rollback, so serializing at upload time would leave every frame
+  behind with no version blob -- and with no version blob, `_list_versions`
+  cannot see them and `delete_artifact` can never reach them.
+  """
+  service = mock_gcs_artifact_service()
+
+  with pytest.raises(InputValidationError, match="JSON-serializable"):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name="media",
+        frames=_media_frames(),
+        custom_metadata={"bad": {1, 2}},
+    )
+
+  written = [
+      name
+      for name, blob in service.bucket.blobs.items()
+      if blob.content is not None
+  ]
+  assert written == []
+
+
+@pytest.mark.asyncio
+async def test_gcs_save_media_frames_reserves_concurrent_versions():
+  """Two overlapping collections get distinct versions, not a silent overwrite.
+
+  Listing does not reserve, so both saves pick the same number; only the
+  `if_generation_match=0` precondition on the version blob forces the loser to
+  retry instead of overwriting the winner's frames and sidecar.
+  """
+  service = mock_gcs_artifact_service()
+  original_list_versions = service._list_versions
+  first_reads = threading.Barrier(2)
+  calls_lock = threading.Lock()
+  synchronized_calls = 0
+
+  def synchronize_initial_reads(**kwargs: Any) -> list[int]:
+    nonlocal synchronized_calls
+    versions = original_list_versions(**kwargs)
+    with calls_lock:
+      synchronized_calls += 1
+      should_wait = synchronized_calls <= 2
+    if should_wait:
+      first_reads.wait(timeout=5)
+    return versions
+
+  save_args = {
+      "app_name": "app",
+      "user_id": "user",
+      "session_id": "session",
+      "collection_name": "media",
+  }
+  with mock.patch.object(
+      service,
+      "_list_versions",
+      side_effect=synchronize_initial_reads,
+  ):
+    saved_versions = await asyncio.gather(
+        service.save_media_frames(
+            **save_args,
+            frames=[
+                MediaFrame(
+                    blob=types.Blob(data=b"first", mime_type="image/jpeg"),
+                    timestamp=0.0,
+                )
+            ],
+        ),
+        service.save_media_frames(
+            **save_args,
+            frames=[
+                MediaFrame(
+                    blob=types.Blob(data=b"second", mime_type="image/jpeg"),
+                    timestamp=0.0,
+                )
+            ],
+        ),
+    )
+
+  assert sorted(saved_versions) == [0, 1]
+
+  # Neither collection's frames were overwritten by the other.
+  frame_payloads = {
+      service.bucket.blobs[
+          f"app/user/session/media/{version}/frames/frame_0000.jpeg"
+      ].content
+      for version in saved_versions
+  }
+  assert frame_payloads == {b"first", b"second"}
+
+
+@pytest.mark.asyncio
+async def test_gcs_delete_artifact_lists_once_for_the_whole_artifact():
+  """Deleting issues one LIST, not one per version.
+
+  The per-version scan this replaced charged an extra LIST to every ordinary
+  artifact, none of which ever has frame children.
+  """
+  service = mock_gcs_artifact_service()
+  save_args = {
+      "app_name": "app",
+      "user_id": "user",
+      "session_id": "session",
+      "filename": "report.txt",
+  }
+  for text in ("v0", "v1", "v2"):
+    await service.save_artifact(**save_args, artifact=types.Part(text=text))
+
+  list_calls = 0
+  original_list_blobs = service.storage_client.list_blobs
+
+  def counting_list_blobs(*args: Any, **kwargs: Any):
+    nonlocal list_calls
+    list_calls += 1
+    return original_list_blobs(*args, **kwargs)
+
+  with mock.patch.object(
+      service.storage_client, "list_blobs", side_effect=counting_list_blobs
+  ):
+    await service.delete_artifact(**save_args)
+
+  assert list_calls == 1
+  assert await service.list_versions(**save_args) == []
+
+
+@pytest.mark.asyncio
+async def test_gcs_delete_artifact_spares_a_nested_artifact():
+  """A nested artifact shares the prefix but is not part of this artifact.
+
+  Filenames may contain "/", so `col/0` is a legal artifact name whose blobs sit
+  directly under the version blobs of `col`. The single listing must classify
+  them out rather than delete them.
+  """
+  service = mock_gcs_artifact_service()
+  scope = {"app_name": "app", "user_id": "user", "session_id": "session"}
+
+  await service.save_media_frames(
+      **scope, collection_name="col", frames=_media_frames()
+  )
+  # Named so its blob (app/user/session/col/0/frames/0) sits under the
+  # collection's own frames directory -- the worst case for prefix matching.
+  await service.save_artifact(
+      **scope,
+      filename="col/0/frames",
+      artifact=types.Part(text="innocent bystander"),
+  )
+
+  await service.delete_artifact(**scope, filename="col")
+
+  assert await service.list_versions(**scope, filename="col") == []
+  assert await service.list_versions(**scope, filename="col/0/frames") == [0]
+  survivor = await service.load_artifact(**scope, filename="col/0/frames")
+  assert survivor is not None
+  assert survivor.text == "innocent bystander"

@@ -195,12 +195,76 @@ and the deployed agent falls back to `InMemoryArtifactService` and loses every
 artifact when it restarts.
 
 Writing your own means subclassing `BaseArtifactService` and implementing its
-seven abstract methods: `save_artifact`, `load_artifact`, `list_artifact_keys`,
+abstract methods: `save_artifact`, `load_artifact`, `list_artifact_keys`,
 `delete_artifact`, `list_versions`, `list_artifact_versions`, and
-`get_artifact_version`. All are keyword-only and take `app_name`, `user_id`, and
-an optional `session_id`, where `None` means the user-scoped namespace. Your
-implementation is responsible for honoring the `user:` prefix, since the routing
-lives in the service and not above it.
+`get_artifact_version`. All are keyword-only and take `app_name`, `user_id`,
+and an optional `session_id`, where `None` means the user-scoped namespace.
+Your implementation is responsible for honoring the `user:`
+prefix, since the routing lives in the service and not above it.
+
+`save_media_frames` is deliberately *not* abstract. It has a default that raises
+`NotImplementedError`, so an existing subclass stays instantiable and only needs
+to override it if it wants to store frame collections.
+
+## Saving media frames (`save_media_frames`)
+
+In addition to individual single-blob artifacts, `BaseArtifactService` supports
+persisting sequences of video/image frames through `save_media_frames`:
+
+```python
+from google.adk.artifacts import MediaFrame
+
+version = await artifact_service.save_media_frames(
+    app_name="vision_app",
+    user_id="u1",
+    session_id="s1",
+    collection_name="input_media_20260101_120000_000000",
+    frames=[
+        MediaFrame(
+            blob=types.Blob(data=frame_bytes_0, mime_type="image/jpeg"),
+            timestamp=0.0,
+        ),
+        MediaFrame(
+            blob=types.Blob(data=frame_bytes_1, mime_type="image/jpeg"),
+            timestamp=0.5,
+        ),
+    ],
+    custom_metadata={"source": "camera_feed"},
+)
+```
+
+Timestamps are seconds and must be non-decreasing; a batch that runs backwards
+is rejected rather than stored with a negative duration.
+
+Each frame is stored in a `frames/` subfolder (e.g. `frame_0000.jpeg`,
+`frame_0001.jpeg`), accompanied by an atomic `metadata.json` document. Your
+`custom_metadata` is merged into the top level of that document, and these keys
+are written over it:
+
+*   `type`: Always `"video_frame_sequence"`.
+*   `frameCount`: Total count of persisted frames.
+*   `startTimestampMs` / `endTimestampMs`: First and last frame timestamps.
+*   `durationMs`: Span from the first frame to the last.
+*   `estimatedFps`: Frames per second derived from those timestamps, or `0.0`
+    for a single frame or a zero-length span.
+*   `frames`: Per-frame `frameIndex`, `offsetMs`, `fileName`, `mimeType`, and
+    `sizeBytes`.
+
+Those keys win a collision, so a caller cannot make the document disagree with
+the frames actually written.
+
+One difference is worth knowing on `GcsArtifactService`: an ordinary artifact's
+`custom_metadata` is stored as Cloud Storage object metadata, which is
+string-valued, so `{"attempt": 3}` reads back as `{"attempt": "3"}`. A
+collection's metadata lives in a JSON sidecar instead -- object metadata is
+capped at a few KiB and a frame index will not fit -- so its values keep their
+original types. `FileArtifactService` and `InMemoryArtifactService` preserve
+types in both cases.
+
+For backward compatibility with preview tools and standard readers, loading the
+collection name directly via `load_artifact(filename=collection_name)` returns the
+initial frame (`frame_0000`) as a `types.Part`.
+
 
 `list_artifact_keys` must be complete: anything readable in scope should be
 returned. Callers (such as `LoadArtifactsTool`) rely on this listing to

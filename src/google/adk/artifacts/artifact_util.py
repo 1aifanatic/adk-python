@@ -21,6 +21,7 @@ from typing import NamedTuple
 from google.genai import types
 
 from ..errors import input_validation_error
+from .base_artifact_service import MediaFrame
 
 
 class ParsedArtifactUri(NamedTuple):
@@ -53,6 +54,108 @@ _SESSION_SCOPED_ARTIFACT_URI_RE = re.compile(
 _USER_SCOPED_ARTIFACT_URI_RE = re.compile(
     rf"artifact://apps/({_PATH_SEGMENT_PATTERN})/users/({_PATH_SEGMENT_PATTERN})/artifacts/(.+)/versions/(\d+)"
 )
+
+# Layout shared by every backend that stores media frame collections.
+FRAMES_DIR_NAME = "frames"
+MEDIA_COLLECTION_TYPE = "video_frame_sequence"
+DEFAULT_FRAME_MIME_TYPE = "image/jpeg"
+DEFAULT_FRAME_EXTENSION = "jpeg"
+
+# Scope marker every backend strips before a name becomes a stored path. Each
+# backend owns its own handling of it; this copy exists so the shared
+# validation below sees the same name storage will.
+_USER_NAMESPACE_PREFIX = "user:"
+
+# A frame extension becomes a path segment, so it is held to the same standard
+# as the caller-supplied identifiers `validate_path_segment` guards: no
+# separators, no traversal, no null bytes. Restricting to the characters real
+# subtypes use is simpler to reason about than enumerating what to reject.
+_FRAME_EXTENSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+._-]*")
+
+
+def frame_extension_from_mime_type(mime_type: str | None) -> str:
+  """Derives the filename extension for a media frame from its mime type.
+
+  The mime type reaches the artifact services from a live model stream, so it
+  is caller-supplied data that ends up inside a path. Anything that is not a
+  plausible subtype -- including values carrying "/" or "\\" separators or ".."
+  traversal segments -- falls back to the default rather than raising, because
+  an odd mime type should not fail a whole frame batch.
+
+  Args:
+    mime_type: The blob mime type, e.g. "image/jpeg" or "image/png;foo=bar".
+
+  Returns:
+    A path-safe extension, defaulting to "jpeg".
+  """
+  subtype = (mime_type or "").split("/")[-1].split(";")[0].strip()
+  if not _FRAME_EXTENSION_RE.fullmatch(subtype):
+    return DEFAULT_FRAME_EXTENSION
+  return subtype
+
+
+def frame_file_name(index: int, mime_type: str | None) -> str:
+  """Returns the `frames/`-relative filename for one frame."""
+  return f"frame_{index:04d}.{frame_extension_from_mime_type(mime_type)}"
+
+
+def validate_media_collection_name(collection_name: str) -> None:
+  """Rejects a collection name that collides with the frames subdirectory.
+
+  `FileArtifactService` stages a version's preview file and its `frames/`
+  subdirectory as siblings, so a collection whose own final segment is "frames"
+  makes them the same path and the save dies partway through with
+  `IsADirectoryError`. The flat-namespace backends have no such collision, but
+  they reject the name too: a caller that can write a collection on one backend
+  and not another has no portable contract to program against, and the failure
+  only shows up after switching backends.
+
+  The name is normalized the way the backends normalize it before it reaches
+  storage -- the `user:` scope marker is not part of the stored path, and the
+  file backend strips surrounding whitespace -- so `user:frames` is caught too.
+
+  Args:
+    collection_name: The caller-supplied media collection name.
+
+  Raises:
+    InputValidationError: If the name's final path segment is "frames".
+  """
+  stripped = collection_name.removeprefix(_USER_NAMESPACE_PREFIX).strip()
+  if stripped.rpartition("/")[2].casefold() == FRAMES_DIR_NAME:
+    raise input_validation_error.InputValidationError(
+        f"Collection filename {collection_name!r} is reserved for media frame"
+        " storage."
+    )
+
+
+def validate_frame_timestamps(
+    frames: list[MediaFrame],
+) -> None:
+  """Rejects a frame batch whose timestamps run backwards.
+
+  Every backend takes `durationMs` from the first and last frame and each
+  frame's `offsetMs` from the first, so an out-of-order batch does not fail --
+  it silently persists a negative duration, negative offsets, and a meaningless
+  `estimatedFps`. Callers buffer frames as they arrive, so out-of-order input
+  means the caller has a bug worth surfacing rather than recording.
+
+  Equal timestamps are allowed: frames captured within the same clock tick are
+  legitimate and yield a zero offset delta.
+
+  Args:
+    frames: The `MediaFrame` batch about to be written.
+
+  Raises:
+    InputValidationError: If any frame predates the frame before it.
+  """
+  for idx in range(1, len(frames)):
+    previous_ts = frames[idx - 1].timestamp
+    current_ts = frames[idx].timestamp
+    if current_ts < previous_ts:
+      raise input_validation_error.InputValidationError(
+          f"Frame timestamps must be non-decreasing, but frame {idx} at"
+          f" {current_ts} precedes frame {idx - 1} at {previous_ts}."
+      )
 
 
 def parse_artifact_uri(uri: str) -> ParsedArtifactUri | None:

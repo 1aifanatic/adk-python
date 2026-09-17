@@ -17,9 +17,17 @@
 from typing import Any
 
 from google.adk.artifacts.base_artifact_service import ArtifactVersion
+from google.adk.artifacts.base_artifact_service import MediaFrame
 from google.adk.tools._forwarding_artifact_service import ForwardingArtifactService
 from google.genai import types
 import pytest
+
+
+class _StubEventActions:
+  """Stub for EventActions, which is where artifact deltas accumulate."""
+
+  def __init__(self):
+    self.artifact_delta: dict[str, int] = {}
 
 
 class _StubToolContext:
@@ -29,6 +37,7 @@ class _StubToolContext:
     self.saved_artifacts = []
     self.loaded_artifacts = []
     self.listed_artifacts = False
+    self.actions = _StubEventActions()
     self._invocation_context = _StubInvocationContext()
 
   async def save_artifact(
@@ -60,6 +69,7 @@ class _StubArtifactService:
     self.listed_versions = []
     self.listed_artifact_versions = []
     self.got_artifact_versions = []
+    self.saved_media_frames = []
 
   async def delete_artifact(
       self,
@@ -109,6 +119,26 @@ class _StubArtifactService:
         (app_name, user_id, filename, session_id, version)
     )
     return ArtifactVersion(version=version or 1, canonical_uri="uri_spec")
+
+  async def save_media_frames(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      session_id: str,
+      collection_name: str,
+      frames: list[MediaFrame],
+      custom_metadata: dict[str, Any] | None = None,
+  ) -> int:
+    self.saved_media_frames.append((
+        app_name,
+        user_id,
+        session_id,
+        collection_name,
+        frames,
+        custom_metadata,
+    ))
+    return len(self.saved_media_frames) - 1
 
 
 class _StubSession:
@@ -312,3 +342,112 @@ async def test_get_artifact_version_raises_value_error_if_no_service():
     await service.get_artifact_version(
         app_name="ignored", user_id="ignored", filename="test.txt", version=3
     )
+
+
+@pytest.mark.asyncio
+async def test_save_media_frames_forwards_to_invocation_context_artifact_service():
+  """Verifies save_media_frames forwards to invocation_context.artifact_service."""
+  tool_context = _StubToolContext()
+  service = ForwardingArtifactService(tool_context)
+
+  frames = [
+      MediaFrame(
+          blob=types.Blob(data=b"frame1", mime_type="image/jpeg"), timestamp=0.0
+      ),
+      MediaFrame(
+          blob=types.Blob(data=b"frame2", mime_type="image/jpeg"), timestamp=0.5
+      ),
+  ]
+  version = await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="test_media",
+      frames=frames,
+  )
+
+  assert version == 0
+  stub_service = tool_context._invocation_context.artifact_service
+  assert len(stub_service.saved_media_frames) == 1
+  assert stub_service.saved_media_frames[0] == (
+      "fake_app",
+      "fake_user",
+      "fake_session_id",
+      "test_media",
+      frames,
+      None,
+  )
+
+
+@pytest.mark.asyncio
+async def test_save_media_frames_raises_value_error_if_no_service():
+  """Verifies save_media_frames raises ValueError if artifact_service is None."""
+  tool_context = _StubToolContext()
+  tool_context._invocation_context.artifact_service = None
+  service = ForwardingArtifactService(tool_context)
+
+  with pytest.raises(ValueError, match="Artifact service is not initialized."):
+    await service.save_media_frames(
+        app_name="ignored",
+        user_id="ignored",
+        session_id="ignored",
+        collection_name="test_media",
+        frames=[
+            MediaFrame(
+                blob=types.Blob(data=b"frame", mime_type="image/jpeg"),
+                timestamp=0.0,
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_save_media_frames_records_artifact_delta():
+  """Verifies save_media_frames records the collection in artifact_delta.
+
+  save_artifact gets this from tool_context.save_artifact, but
+  save_media_frames has to call the artifact service directly, so the delta is
+  recorded explicitly. Without it the collection is invisible to session
+  rewind, A2A artifact events and SSE artifact notifications.
+  """
+  tool_context = _StubToolContext()
+  service = ForwardingArtifactService(tool_context)
+
+  version = await service.save_media_frames(
+      app_name="app",
+      user_id="user",
+      session_id="session",
+      collection_name="test_media",
+      frames=[
+          MediaFrame(
+              blob=types.Blob(data=b"frame", mime_type="image/jpeg"),
+              timestamp=0.0,
+          )
+      ],
+  )
+
+  assert tool_context.actions.artifact_delta == {"test_media": version}
+
+
+@pytest.mark.asyncio
+async def test_save_media_frames_does_not_record_delta_on_failure():
+  """Verifies a failed save leaves artifact_delta untouched."""
+  tool_context = _StubToolContext()
+  tool_context._invocation_context.artifact_service = None
+  service = ForwardingArtifactService(tool_context)
+
+  with pytest.raises(ValueError):
+    await service.save_media_frames(
+        app_name="app",
+        user_id="user",
+        session_id="session",
+        collection_name="test_media",
+        frames=[
+            MediaFrame(
+                blob=types.Blob(data=b"frame", mime_type="image/jpeg"),
+                timestamp=0.0,
+            )
+        ],
+    )
+
+  assert not tool_context.actions.artifact_delta

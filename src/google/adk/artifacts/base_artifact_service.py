@@ -64,6 +64,32 @@ class ArtifactVersion(BaseModel):
   )
 
 
+class MediaFrame(BaseModel):
+  """One frame of a media collection passed to `save_media_frames`.
+
+  A bare `(blob, timestamp)` tuple would be cheaper, but it fixes the shape
+  permanently: a per-frame sequence number, capture source or encoding hint
+  could not be added later without breaking every caller. A model can gain
+  optional fields compatibly.
+  """
+
+  model_config = ConfigDict(
+      alias_generator=alias_generators.to_camel,
+      populate_by_name=True,
+  )
+
+  blob: types.Blob = Field(
+      description="The frame payload together with its MIME type."
+  )
+  timestamp: float = Field(
+      description=(
+          "Capture time in seconds. The collection's duration comes from the"
+          " first and last frame and each frame's offset from the first, so"
+          " timestamps must be non-decreasing across the batch."
+      )
+  )
+
+
 def ensure_part(artifact: Union[types.Part, dict[str, Any]]) -> types.Part:
   """Normalizes an artifact to a ``types.Part`` instance.
 
@@ -121,6 +147,33 @@ class BaseArtifactService(ABC):
       The revision ID. The first version of the artifact has a revision ID of 0.
       This is incremented by 1 after each successful save.
     """
+
+  async def save_media_frames(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      collection_name: str,
+      frames: list[MediaFrame],
+      session_id: Optional[str] = None,
+      custom_metadata: Optional[dict[str, Any]] = None,
+  ) -> int:
+    """Saves a sequence of media frames to artifact storage.
+
+    Args:
+      app_name: The app name.
+      user_id: The user ID.
+      collection_name: The name of the collection folder for these frames.
+      frames: The frames to store, in non-decreasing timestamp order.
+      session_id: The session ID. If None, the artifact is user-scoped.
+      custom_metadata: Optional custom metadata to associate with the frames.
+
+    Returns:
+      The revision/version integer of the stored media collection.
+    """
+    raise NotImplementedError(
+        f"{type(self).__name__} does not implement save_media_frames."
+    )
 
   @abstractmethod
   async def load_artifact(

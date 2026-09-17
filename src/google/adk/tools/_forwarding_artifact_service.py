@@ -24,6 +24,7 @@ from typing_extensions import override
 from ..artifacts.base_artifact_service import ArtifactVersion
 from ..artifacts.base_artifact_service import BaseArtifactService
 from ..artifacts.base_artifact_service import ensure_part
+from ..artifacts.base_artifact_service import MediaFrame
 
 if TYPE_CHECKING:
   from .tool_context import ToolContext
@@ -52,6 +53,40 @@ class ForwardingArtifactService(BaseArtifactService):
         artifact=ensure_part(artifact),
         custom_metadata=custom_metadata,
     )
+
+  @override
+  async def save_media_frames(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      collection_name: str,
+      frames: list[MediaFrame],
+      session_id: Optional[str] = None,
+      custom_metadata: Optional[dict[str, Any]] = None,
+  ) -> int:
+    del app_name, user_id, session_id
+    if self._invocation_context.artifact_service is None:
+      raise ValueError("Artifact service is not initialized.")
+    version = await self._invocation_context.artifact_service.save_media_frames(
+        app_name=self._invocation_context.app_name,
+        user_id=self._invocation_context.user_id,
+        session_id=(
+            self._invocation_context.session.id
+            if self._invocation_context.session
+            else None
+        ),
+        collection_name=collection_name,
+        frames=frames,
+        custom_metadata=custom_metadata,
+    )
+    # save_artifact gets this for free by going through tool_context; this
+    # method has to call the artifact service directly (ToolContext has no
+    # save_media_frames), so record the delta here. Without it the collection
+    # is invisible to session rewind, A2A artifact events and the SSE artifact
+    # notifications.
+    self.tool_context.actions.artifact_delta[collection_name] = version
+    return version
 
   @override
   async def load_artifact(

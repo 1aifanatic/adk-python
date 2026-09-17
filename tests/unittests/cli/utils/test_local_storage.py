@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from google.adk.artifacts import file_artifact_service
+from google.adk.artifacts.base_artifact_service import MediaFrame
 from google.adk.artifacts.file_artifact_service import FileArtifactService
 from google.adk.cli.utils.local_storage import create_local_artifact_service
 from google.adk.cli.utils.local_storage import create_local_database_session_service
@@ -394,3 +395,62 @@ async def test_per_agent_artifact_service_delete_removes_legacy_copy(
   assert await service.load_artifact(filename="legacy.txt", **scope) is None
   assert await service.list_artifact_keys(**scope) == []
   assert await legacy.list_artifact_keys(**scope) == []
+
+
+@pytest.mark.asyncio
+async def test_per_agent_artifact_service_save_media_frames_routes_per_agent(
+    tmp_path: Path,
+) -> None:
+  """save_media_frames must route to the agent's own store like save_artifact.
+
+  Without this, a routing or argument-forwarding regression in the delegation
+  goes unnoticed: nothing else exercises this override.
+  """
+  agent_a = tmp_path / "agent_a"
+  agent_b = tmp_path / "agent_b"
+  agent_a.mkdir()
+  agent_b.mkdir()
+  service = PerAgentFileArtifactService(agents_root=tmp_path)
+
+  version = await service.save_media_frames(
+      app_name="agent_a",
+      user_id="user",
+      session_id="session",
+      collection_name="media",
+      frames=[
+          MediaFrame(
+              blob=types.Blob(data=b"frame_0", mime_type="image/jpeg"),
+              timestamp=0.0,
+          ),
+          MediaFrame(
+              blob=types.Blob(data=b"frame_1", mime_type="image/jpeg"),
+              timestamp=0.5,
+          ),
+      ],
+      custom_metadata={"source": "cam"},
+  )
+
+  assert version == 0
+  assert (agent_a / ".adk" / "artifacts").exists()
+  assert not (agent_b / ".adk").exists()
+  assert not (tmp_path / ".adk").exists()
+
+  scope = {"app_name": "agent_a", "user_id": "user", "session_id": "session"}
+  preview = await service.load_artifact(filename="media", **scope)
+  assert preview is not None
+  assert preview.inline_data.data == b"frame_0"
+
+  artifact_version = await service.get_artifact_version(
+      filename="media", **scope
+  )
+  assert artifact_version is not None
+  assert artifact_version.custom_metadata["frameCount"] == 2
+  assert artifact_version.custom_metadata["source"] == "cam"
+
+  # The other agent's store must not see it.
+  assert (
+      await service.list_artifact_keys(
+          app_name="agent_b", user_id="user", session_id="session"
+      )
+      == []
+  )

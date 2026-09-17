@@ -28,6 +28,7 @@ from typing_extensions import override
 
 from ...artifacts.base_artifact_service import ArtifactVersion
 from ...artifacts.base_artifact_service import BaseArtifactService
+from ...artifacts.base_artifact_service import MediaFrame
 from ...artifacts.file_artifact_service import FileArtifactService
 from ...events.event import Event
 from ...sessions.base_session_service import BaseSessionService
@@ -331,6 +332,27 @@ class PerAgentFileArtifactService(BaseArtifactService):
         user_id=user_id,
         filename=filename,
         artifact=artifact,
+        session_id=session_id,
+        custom_metadata=custom_metadata,
+    )
+
+  @override
+  async def save_media_frames(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      collection_name: str,
+      frames: list[MediaFrame],
+      session_id: Optional[str] = None,
+      custom_metadata: Optional[dict[str, Any]] = None,
+  ) -> int:
+    service = await self._get_service(app_name)
+    return await service.save_media_frames(
+        app_name=app_name,
+        user_id=user_id,
+        collection_name=collection_name,
+        frames=frames,
         session_id=session_id,
         custom_metadata=custom_metadata,
     )

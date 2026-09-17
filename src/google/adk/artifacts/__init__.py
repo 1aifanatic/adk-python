@@ -18,6 +18,7 @@ import importlib
 from typing import TYPE_CHECKING
 
 from .base_artifact_service import BaseArtifactService
+from .base_artifact_service import MediaFrame
 
 if TYPE_CHECKING:
   from .file_artifact_service import FileArtifactService
@@ -29,6 +30,7 @@ __all__ = [
     'FileArtifactService',
     'GcsArtifactService',
     'InMemoryArtifactService',
+    'MediaFrame',
 ]
 
 _LAZY_MEMBERS: dict[str, str] = {

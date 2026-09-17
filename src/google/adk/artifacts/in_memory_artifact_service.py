@@ -30,6 +30,7 @@ from ..errors.input_validation_error import InputValidationError
 from .base_artifact_service import ArtifactVersion
 from .base_artifact_service import BaseArtifactService
 from .base_artifact_service import ensure_part
+from .base_artifact_service import MediaFrame
 
 logger = logging.getLogger("google_adk." + __name__)
 
@@ -39,12 +40,16 @@ class _ArtifactEntry:
   """Represents a single version of an artifact stored in memory.
 
   Attributes:
-    data: The actual data of the artifact.
+    data: The actual data of the artifact. For a media frame collection this
+      is the preview frame only, matching what `load_artifact` returns.
     artifact_version: Metadata about this specific version of the artifact.
+    media_frames: Every frame of a media collection, in order, or None for an
+      ordinary artifact.
   """
 
   data: types.Part
   artifact_version: ArtifactVersion
+  media_frames: Optional[list[types.Blob]] = None
 
 
 # Runner._compute_artifact_delta_for_rewind marks an artifact as
@@ -177,6 +182,119 @@ class InMemoryArtifactService(BaseArtifactService, BaseModel):
 
     self.artifacts[path].append(
         _ArtifactEntry(data=artifact, artifact_version=artifact_version)
+    )
+    return version
+
+  @override
+  async def save_media_frames(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      collection_name: str,
+      frames: list[MediaFrame],
+      session_id: Optional[str] = None,
+      custom_metadata: Optional[dict[str, Any]] = None,
+  ) -> int:
+    if not frames:
+      raise InputValidationError("Cannot save empty frames list.")
+
+    artifact_util.validate_media_collection_name(collection_name)
+
+    if not self._file_has_user_namespace(collection_name):
+      if session_id is None:
+        raise InputValidationError(
+            "Session ID must be provided for session-scoped artifacts."
+        )
+      artifact_util._validate_session_id_for_flat_storage(session_id)
+
+    # Match FileArtifactService and GcsArtifactService, which both reject empty
+    # frames. Accepting them here would let a batch pass in tests and in `adk
+    # web` and then fail against a durable backend in production.
+    for idx, frame in enumerate(frames):
+      if not frame.blob.data:
+        raise InputValidationError(f"Frame {idx} has no byte data.")
+
+    artifact_util.validate_frame_timestamps(frames)
+
+    path = self._artifact_path(app_name, user_id, collection_name, session_id)
+    if path not in self.artifacts:
+      self.artifacts[path] = []
+    version = len(self.artifacts[path])
+
+    if self._file_has_user_namespace(collection_name):
+      canonical_uri = f"memory://apps/{app_name}/users/{user_id}/artifacts/{collection_name}/versions/{version}"
+    else:
+      canonical_uri = f"memory://apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{collection_name}/versions/{version}"
+
+    start_ts = frames[0].timestamp
+    end_ts = frames[-1].timestamp
+    duration_ms = int((end_ts - start_ts) * 1000)
+    frame_count = len(frames)
+    estimated_fps = (
+        round((frame_count - 1) / (end_ts - start_ts), 2)
+        if duration_ms > 0 and frame_count > 1
+        else 0.0
+    )
+
+    frame_indices = []
+    for idx, frame in enumerate(frames):
+      blob = frame.blob
+      mime = (blob.mime_type or artifact_util.DEFAULT_FRAME_MIME_TYPE).lower()
+      offset_ms = int((frame.timestamp - start_ts) * 1000)
+      frame_indices.append({
+          "frameIndex": idx,
+          "offsetMs": offset_ms,
+          "fileName": (
+              f"{artifact_util.FRAMES_DIR_NAME}/"
+              f"{artifact_util.frame_file_name(idx, mime)}"
+          ),
+          "mimeType": mime,
+          "sizeBytes": len(blob.data or b""),
+      })
+
+    merged_custom_metadata = dict(custom_metadata or {})
+    merged_custom_metadata.update({
+        "type": artifact_util.MEDIA_COLLECTION_TYPE,
+        "frameCount": frame_count,
+        "startTimestampMs": int(start_ts * 1000),
+        "endTimestampMs": int(end_ts * 1000),
+        "durationMs": duration_ms,
+        "estimatedFps": estimated_fps,
+        "frames": frame_indices,
+    })
+
+    # Lowercased for the same reason the per-frame `mime` above is: the File and
+    # GCS backends normalize here, and the frame entries in custom_metadata
+    # already hold the lowercased form.
+    primary_mime_type = (
+        frames[0].blob.mime_type or artifact_util.DEFAULT_FRAME_MIME_TYPE
+    ).lower()
+    artifact_version = ArtifactVersion(
+        version=version,
+        canonical_uri=canonical_uri,
+        custom_metadata=merged_custom_metadata,
+        mime_type=primary_mime_type,
+    )
+
+    preview_part = types.Part(
+        inline_data=types.Blob(
+            data=frames[0].blob.data,
+            mime_type=primary_mime_type,
+        )
+    )
+
+    self.artifacts[path].append(
+        _ArtifactEntry(
+            data=preview_part,
+            artifact_version=artifact_version,
+            # `data` is only the preview, mirroring what load_artifact returns
+            # for the durable backends. Those write every frame to storage, so
+            # keep the full payloads here too rather than dropping frames[1:];
+            # otherwise the same code loses media depending on which service
+            # happens to be configured.
+            media_frames=[frame.blob for frame in frames],
+        )
     )
     return version
 
